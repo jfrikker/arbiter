@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package arbiter;
+
+message StartTransaction {
+    uint64 txn_id = 1;
+}
+
+message ResourceRead {
+    uint64 txn_id = 1;
+    string resource_id = 2;
+}
+
+message IncomingMessage {
+    oneof message {
+        StartTransaction start_transaction = 1;
+        ResourceRead resource_read = 2;
+    }
+}

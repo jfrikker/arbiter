@@ -1,0 +1,14 @@
+[package]
+name = "arbiter"
+version = "0.1.0"
+authors = ["Joe Frikker <jfrikker@gmail.com>"]
+edition = "2018"
+build = "build.rs"
+
+[dependencies]
+bytes = "0.4"
+prost = "0.5"
+tokio = "0.1"
+
+[build-dependencies]
+prost-build = { version = "0.5" }
