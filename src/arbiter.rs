@@ -310,6 +310,19 @@ mod tests {
     }
 
     #[test]
+    fn non_blocking_txn() {
+        let mut arbiter: Arbiter<i32> = Arbiter::new();
+        let id1 = arbiter.start_transaction();
+        let id2 = arbiter.start_transaction();
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(id1, 100));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id1, 100));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(id1)), arbiter.start_commit(id1));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id2, 101));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(id2)), arbiter.start_commit(id2));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.commit_completed(id2));
+    }
+
+    #[test]
     fn read_write_conflict_before_commit() {
         let mut arbiter: Arbiter<i32> = Arbiter::new();
         let id1 = arbiter.start_transaction();
