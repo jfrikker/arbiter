@@ -3,21 +3,20 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
 
-pub type TID = u64;
+type CID = u64;
 
-pub struct Arbiter<RID> {
-    next_id: TID,
-    next_commit_id: TID,
-    completed_txns: VecDeque<(TID, HashSet<RID>)>,
+pub struct Arbiter<TID, RID> {
+    next_commit_id: CID,
+    completed_txns: VecDeque<(CID, HashSet<RID>)>,
     pending_commits: HashSet<RID>,
     txns: LinkedHashMap<TID, TransactionState<RID>>
 }
 
-impl <RID> Arbiter<RID>
-    where RID: Eq + Hash + Clone + Debug {
+impl <TID, RID> Arbiter<TID, RID>
+    where TID: Eq + Hash + Clone + Debug,
+          RID: Eq + Hash + Clone + Debug {
     pub fn new() -> Self {
         Arbiter {
-            next_id: 0,
             next_commit_id: 0,
             completed_txns: VecDeque::new(),
             pending_commits: HashSet::new(),
@@ -25,39 +24,38 @@ impl <RID> Arbiter<RID>
         }
     }
 
-    pub fn start_transaction(&mut self) -> TID {
-        let id = self.next_id;
-        self.next_id = self.next_id + 1;
-        self.txns.insert(id.clone(), TransactionState::new(id, self.next_commit_id));
-        id
+    pub fn start_transaction(&mut self, id: TID) {
+        self.txns.insert(id, TransactionState::new(self.next_commit_id));
     }
 
-    pub fn transaction_progress_many<R, W>(&mut self, id: TID, read: HashSet<RID>, written: HashSet<RID>) -> Result<TransactionUpdate> {
-        self.with_transaction(id, |txn| txn.transaction_progress_many(read, written))?;
+    pub fn transaction_progress_many<R, W>(&mut self, id: &TID, read: R, written: W) -> Result<TransactionUpdate<TID>, TID>
+        where R: IntoIterator<Item=RID>,
+              W: IntoIterator<Item=RID> {
+        self.with_transaction(id, |txn| txn.transaction_progress_many(id, read, written))?;
         Ok(self.advance_txns())
     }
 
-    pub fn transaction_progress_read(&mut self, id: TID, read: RID) -> Result<TransactionUpdate> {
-        self.with_transaction(id, |txn| txn.transaction_progress_read(read))?;
+    pub fn transaction_progress_read(&mut self, id: &TID, read: RID) -> Result<TransactionUpdate<TID>, TID> {
+        self.with_transaction(id, |txn| txn.transaction_progress_read(id, read))?;
         Ok(self.advance_txns())
     }
 
-    pub fn transaction_progress_write(&mut self, id: TID, written: RID) -> Result<TransactionUpdate> {
-        self.with_transaction(id, |txn| txn.transaction_progress_write(written))?;
+    pub fn transaction_progress_write(&mut self, id: &TID, written: RID) -> Result<TransactionUpdate<TID>, TID> {
+        self.with_transaction(id, |txn| txn.transaction_progress_write(id, written))?;
         Ok(self.advance_txns())
     }
 
-    pub fn start_commit(&mut self, id: TID) -> Result<TransactionUpdate> {
-        self.with_transaction(id, |txn| txn.wait_commit())?;
+    pub fn start_commit(&mut self, id: &TID) -> Result<TransactionUpdate<TID>, TID> {
+        self.with_transaction(id, |txn| txn.wait_commit(id))?;
         Ok(self.advance_txns())
     }
 
-    pub fn commit_completed(&mut self, id: TID) -> Result<TransactionUpdate> {
-        let txn = self.txns.remove(&id).ok_or_else(|| ArbiterError::UnknownTransaction(id))?;
+    pub fn commit_completed(&mut self, id: &TID) -> Result<TransactionUpdate<TID>, TID> {
+        let txn = self.txns.remove(&id).ok_or_else(|| Error::UnknownTransaction(id.clone()))?;
         if txn.state_type != TransactionStateType::Committing {
             // TODO: This changes the order
-            self.txns.insert(id, txn);
-            return Err(ArbiterError::InvalidTransactionState(id));
+            self.txns.insert(id.clone(), txn);
+            return Err(Error::InvalidTransactionState(id.clone()));
         }
 
         let commit_id = self.next_commit_id;
@@ -70,7 +68,7 @@ impl <RID> Arbiter<RID>
         Ok(self.advance_txns())
     }
 
-    fn advance_txns(&mut self) -> TransactionUpdate {
+    fn advance_txns(&mut self) -> TransactionUpdate<TID> {
         let mut result = TransactionUpdate::no_change();
         result.merge(self.advance_impossible_writes());
         result.merge(self.advance_pending_commits());
@@ -80,15 +78,15 @@ impl <RID> Arbiter<RID>
         result
     }
 
-    fn advance_impossible_writes(&mut self) -> TransactionUpdate {
+    fn advance_impossible_writes(&mut self) -> TransactionUpdate<TID> {
         let mut result = TransactionUpdate::no_change();
-        for (_, txn) in self.txns.iter_mut().rev() {
+        for (id, txn) in self.txns.iter_mut().rev() {
             match txn.state_type {
                 TransactionStateType::InProgress |
                 TransactionStateType::WaitCommit => {
                     for (seq, committed_writes) in self.completed_txns.iter() {
                         if *seq >= txn.created_commit && txn.is_commit_prevented(&committed_writes) {
-                            result.mark_failed(txn.id);
+                            result.mark_failed(id.clone());
                         }
                     }
                 }
@@ -103,14 +101,14 @@ impl <RID> Arbiter<RID>
         result
     }
 
-    fn advance_pending_commits(&mut self) -> TransactionUpdate {
+    fn advance_pending_commits(&mut self) -> TransactionUpdate<TID> {
         let mut result = TransactionUpdate::no_change();
-        for (_, txn) in self.txns.iter_mut() {
+        for (id, txn) in self.txns.iter_mut() {
             match txn.state_type {
                 TransactionStateType::WaitCommit => {
-                    if txn.try_commit(&self.pending_commits).unwrap() {
+                    if txn.try_commit(id, &self.pending_commits).unwrap() {
                         self.pending_commits.extend(txn.written.iter().cloned());
-                        result.mark_can_commit(txn.id);
+                        result.mark_can_commit(id.clone());
                     }
                 }
                 _ => {}
@@ -130,15 +128,14 @@ impl <RID> Arbiter<RID>
         }
     }
 
-    fn with_transaction<F, R>(&mut self, id: TID, f: F) -> Result<R>
-        where F: FnOnce(&mut TransactionState<RID>) -> Result<R> {
-        self.txns.get_mut(&id).map_or(Err(ArbiterError::UnknownTransaction(id)), f)
+    fn with_transaction<F, R>(&mut self, id: &TID, f: F) -> Result<R, TID>
+        where F: FnOnce(&mut TransactionState<RID>) -> Result<R, TID> {
+        self.txns.get_mut(id).map_or(Err(Error::UnknownTransaction(id.clone())), f)
     }
 }
 
 struct TransactionState<RID> {
-    id: TID,
-    created_commit: TID,
+    created_commit: CID,
     state_type: TransactionStateType,
     read: HashSet<RID>,
     written: HashSet<RID>
@@ -146,9 +143,8 @@ struct TransactionState<RID> {
 
 impl <RID> TransactionState<RID>
     where RID: Eq + Hash + Clone {
-    fn new(id: TID, created_commit: TID) -> TransactionState<RID> {
+    fn new(created_commit: CID) -> TransactionState<RID> {
         TransactionState {
-            id,
             created_commit,
             state_type: TransactionStateType::InProgress,
             read: HashSet::new(),
@@ -156,7 +152,7 @@ impl <RID> TransactionState<RID>
         }
     }
 
-    fn transaction_progress_many<R, W> (&mut self, read: R, written: W) -> Result<()>
+    fn transaction_progress_many<TID: Clone, R, W> (&mut self, id: &TID, read: R, written: W) -> Result<(), TID>
         where R: IntoIterator<Item=RID>,
               W: IntoIterator<Item=RID> {
         match self.state_type {
@@ -164,40 +160,40 @@ impl <RID> TransactionState<RID>
                 self.read.extend(read.into_iter());
                 self.written.extend(written.into_iter());
             },
-            _ => return Err(ArbiterError::InvalidTransactionState(self.id))
+            _ => return Err(Error::InvalidTransactionState(id.clone()))
         }
         Ok(())
     }
 
-    fn transaction_progress_read(&mut self, read: RID) -> Result<()> {
+    fn transaction_progress_read<TID: Clone>(&mut self, id: &TID, read: RID) -> Result<(), TID> {
         match self.state_type {
             TransactionStateType::InProgress => {
                 self.read.insert(read);
             },
-            _ => return Err(ArbiterError::InvalidTransactionState(self.id))
+            _ => return Err(Error::InvalidTransactionState(id.clone()))
         }
         Ok(())
     }
 
-    fn transaction_progress_write(&mut self, written: RID) -> Result<()> {
+    fn transaction_progress_write<TID: Clone>(&mut self, id: &TID, written: RID) -> Result<(), TID> {
         match self.state_type {
             TransactionStateType::InProgress => {
                 self.written.insert(written);
             },
-            _ => return Err(ArbiterError::InvalidTransactionState(self.id))
+            _ => return Err(Error::InvalidTransactionState(id.clone()))
         }
         Ok(())
     }
 
-    fn wait_commit(&mut self) -> Result<()> {
+    fn wait_commit<TID: Clone>(&mut self, id: &TID) -> Result<(), TID> {
         match self.state_type {
             TransactionStateType::InProgress => self.state_type = TransactionStateType::WaitCommit,
-            _ => return Err(ArbiterError::InvalidTransactionState(self.id))
+            _ => return Err(Error::InvalidTransactionState(id.clone()))
         }
         Ok(())
     }
 
-    fn try_commit(&mut self, pending_writes: &HashSet<RID>) -> Result<bool> {
+    fn try_commit<TID: Clone>(&mut self, id: &TID, pending_writes: &HashSet<RID>) -> Result<bool, TID> {
         match self.state_type {
             TransactionStateType::WaitCommit => {
                 let can_commit = self.written.is_disjoint(pending_writes);
@@ -206,14 +202,14 @@ impl <RID> TransactionState<RID>
                 }
                 Ok(can_commit)
             },
-            _ => return Err(ArbiterError::InvalidTransactionState(self.id))
+            _ => return Err(Error::InvalidTransactionState(id.clone()))
         }
     }
 
-    fn commit_completed(&mut self) -> Result<()> {
+    fn commit_completed<TID: Clone>(&mut self, id: &TID) -> Result<(), TID> {
         match self.state_type {
             TransactionStateType::Committing => {}
-            _ => return Err(ArbiterError::InvalidTransactionState(self.id.clone()))
+            _ => return Err(Error::InvalidTransactionState(id.clone()))
         }
         Ok(())
     }
@@ -235,20 +231,20 @@ enum TransactionStateType {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ArbiterError {
+pub enum Error<TID> {
     UnknownTransaction(TID),
     InvalidTransactionState(TID)
 }
 
-pub type Result<T> = std::result::Result<T, ArbiterError>;
+pub type Result<T, TID> = std::result::Result<T, Error<TID>>;
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct TransactionUpdate {
+pub struct TransactionUpdate<TID> {
     can_commit: Vec<TID>,
     failed: Vec<TID>
 }
 
-impl TransactionUpdate {
+impl <TID> TransactionUpdate<TID> {
     fn no_change() -> Self {
         TransactionUpdate {
             can_commit: Vec::new(),
@@ -288,61 +284,61 @@ mod tests {
 
     #[test]
     fn single_txn() {
-        let mut arbiter: Arbiter<i32> = Arbiter::new();
-        let id = arbiter.start_transaction();
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(id, 100));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id, 100));
-        assert_eq!(Ok(TransactionUpdate::with_can_commit(id)), arbiter.start_commit(id));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.commit_completed(id));
+        let mut arbiter: Arbiter<i32, i32> = Arbiter::new();
+        arbiter.start_transaction(1);
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(1)), arbiter.start_commit(&1));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.commit_completed(&1));
     }
 
     #[test]
     fn blocking_txn() {
-        let mut arbiter: Arbiter<i32> = Arbiter::new();
-        let id1 = arbiter.start_transaction();
-        let id2 = arbiter.start_transaction();
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(id1, 100));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id1, 100));
-        assert_eq!(Ok(TransactionUpdate::with_can_commit(id1)), arbiter.start_commit(id1));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id2, 100));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.start_commit(id2));
-        assert_eq!(Ok(TransactionUpdate::with_can_commit(id2)), arbiter.commit_completed(id1));
+        let mut arbiter: Arbiter<i32, i32> = Arbiter::new();
+        arbiter.start_transaction(1);
+        arbiter.start_transaction(2);
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(1)), arbiter.start_commit(&1));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(&2, 100));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.start_commit(&2));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(2)), arbiter.commit_completed(&1));
     }
 
     #[test]
     fn non_blocking_txn() {
-        let mut arbiter: Arbiter<i32> = Arbiter::new();
-        let id1 = arbiter.start_transaction();
-        let id2 = arbiter.start_transaction();
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(id1, 100));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id1, 100));
-        assert_eq!(Ok(TransactionUpdate::with_can_commit(id1)), arbiter.start_commit(id1));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id2, 101));
-        assert_eq!(Ok(TransactionUpdate::with_can_commit(id2)), arbiter.start_commit(id2));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.commit_completed(id2));
+        let mut arbiter: Arbiter<i32, i32> = Arbiter::new();
+        arbiter.start_transaction(1);
+        arbiter.start_transaction(2);
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(1)), arbiter.start_commit(&1));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(&2, 101));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(2)), arbiter.start_commit(&2));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.commit_completed(&2));
     }
 
     #[test]
     fn read_write_conflict_before_commit() {
-        let mut arbiter: Arbiter<i32> = Arbiter::new();
-        let id1 = arbiter.start_transaction();
-        let id2 = arbiter.start_transaction();
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(id1, 100));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id1, 100));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(id2, 100));
-        assert_eq!(Ok(TransactionUpdate::with_can_commit(id1)), arbiter.start_commit(id1));
-        assert_eq!(Ok(TransactionUpdate::with_failed(id2)), arbiter.commit_completed(id1));
+        let mut arbiter: Arbiter<i32, i32> = Arbiter::new();
+        arbiter.start_transaction(1);
+        arbiter.start_transaction(2);
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(&2, 100));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(1)), arbiter.start_commit(&1));
+        assert_eq!(Ok(TransactionUpdate::with_failed(2)), arbiter.commit_completed(&1));
     }
 
     #[test]
     fn read_write_conflict_after_commit() {
-        let mut arbiter: Arbiter<i32> = Arbiter::new();
-        let id1 = arbiter.start_transaction();
-        let id2 = arbiter.start_transaction();
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(id1, 100));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(id1, 100));
-        assert_eq!(Ok(TransactionUpdate::with_can_commit(id1)), arbiter.start_commit(id1));
-        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.commit_completed(id1));
-        assert_eq!(Ok(TransactionUpdate::with_failed(id2)), arbiter.transaction_progress_read(id2, 100));
+        let mut arbiter: Arbiter<i32, i32> = Arbiter::new();
+        arbiter.start_transaction(1);
+        arbiter.start_transaction(2);
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_read(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.transaction_progress_write(&1, 100));
+        assert_eq!(Ok(TransactionUpdate::with_can_commit(1)), arbiter.start_commit(&1));
+        assert_eq!(Ok(TransactionUpdate::no_change()), arbiter.commit_completed(&1));
+        assert_eq!(Ok(TransactionUpdate::with_failed(2)), arbiter.transaction_progress_read(&2, 100));
     }
 }

@@ -8,7 +8,9 @@ build = "build.rs"
 [dependencies]
 bytes = "0.4"
 linked-hash-map = "0.5"
+log = "0.4"
 prost = "0.5"
+stderrlog = "0.4"
 tokio = "0.1"
 
 [build-dependencies]

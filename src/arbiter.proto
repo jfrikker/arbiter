@@ -2,18 +2,29 @@ syntax = "proto3";
 
 package arbiter;
 
-message StartTransaction {
-    uint64 txn_id = 1;
-}
-
-message ResourceRead {
-    uint64 txn_id = 1;
-    string resource_id = 2;
-}
-
 message IncomingMessage {
     oneof message {
         StartTransaction start_transaction = 1;
-        ResourceRead resource_read = 2;
+        ResourcesAccessed resources_accessed = 2;
     }
+}
+
+message StartTransaction {
+    uint64 tid = 1;
+}
+
+message ResourcesAccessed {
+    uint64 tid = 1;
+    repeated string read_rids = 2;
+    repeated string written_rids = 3;
+}
+
+message OutgoingMessage {
+    oneof message {
+        InvalidRequest invalid_request = 1;
+    }
+}
+
+message InvalidRequest {
+    string description = 1;
 }
