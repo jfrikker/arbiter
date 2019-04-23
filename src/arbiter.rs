@@ -9,7 +9,7 @@ pub struct Arbiter<TID, RID> {
     next_commit_id: CID,
     completed_txns: VecDeque<(CID, HashSet<RID>)>,
     pending_commits: HashSet<RID>,
-    txns: LinkedHashMap<TID, TransactionState<RID>>
+    txns: LinkedHashMap<TID, Transaction<RID>>
 }
 
 impl <TID, RID> Arbiter<TID, RID>
@@ -24,38 +24,42 @@ impl <TID, RID> Arbiter<TID, RID>
         }
     }
 
-    pub fn start_transaction(&mut self, id: TID) {
-        self.txns.insert(id, TransactionState::new(self.next_commit_id));
+    pub fn get_state(&self, id: &TID) -> Result<TransactionState> {
+        self.with_transaction(id, |txn| Ok(txn.state_type))
     }
 
-    pub fn transaction_progress_many<R, W>(&mut self, id: &TID, read: R, written: W) -> Result<TransactionUpdate<TID>, TID>
+    pub fn start_transaction(&mut self, id: TID) {
+        self.txns.insert(id, Transaction::new(self.next_commit_id));
+    }
+
+    pub fn transaction_progress_many<R, W>(&mut self, id: &TID, read: R, written: W) -> Result<TransactionUpdate<TID>>
         where R: IntoIterator<Item=RID>,
               W: IntoIterator<Item=RID> {
-        self.with_transaction(id, |txn| txn.transaction_progress_many(id, read, written))?;
+        self.with_transaction_mut(id, |txn| txn.transaction_progress_many(read, written))?;
         Ok(self.advance_txns())
     }
 
-    pub fn transaction_progress_read(&mut self, id: &TID, read: RID) -> Result<TransactionUpdate<TID>, TID> {
-        self.with_transaction(id, |txn| txn.transaction_progress_read(id, read))?;
+    pub fn transaction_progress_read(&mut self, id: &TID, read: RID) -> Result<TransactionUpdate<TID>> {
+        self.with_transaction_mut(id, |txn| txn.transaction_progress_read(read))?;
         Ok(self.advance_txns())
     }
 
-    pub fn transaction_progress_write(&mut self, id: &TID, written: RID) -> Result<TransactionUpdate<TID>, TID> {
-        self.with_transaction(id, |txn| txn.transaction_progress_write(id, written))?;
+    pub fn transaction_progress_write(&mut self, id: &TID, written: RID) -> Result<TransactionUpdate<TID>> {
+        self.with_transaction_mut(id, |txn| txn.transaction_progress_write(written))?;
         Ok(self.advance_txns())
     }
 
-    pub fn start_commit(&mut self, id: &TID) -> Result<TransactionUpdate<TID>, TID> {
-        self.with_transaction(id, |txn| txn.wait_commit(id))?;
+    pub fn start_commit(&mut self, id: &TID) -> Result<TransactionUpdate<TID>> {
+        self.with_transaction_mut(id, |txn| txn.wait_commit())?;
         Ok(self.advance_txns())
     }
 
-    pub fn commit_completed(&mut self, id: &TID) -> Result<TransactionUpdate<TID>, TID> {
-        let txn = self.txns.remove(&id).ok_or_else(|| Error::UnknownTransaction(id.clone()))?;
-        if txn.state_type != TransactionStateType::Committing {
+    pub fn commit_completed(&mut self, id: &TID) -> Result<TransactionUpdate<TID>> {
+        let txn = self.txns.remove(&id).ok_or_else(|| Error::UnknownTransaction)?;
+        if txn.state_type != TransactionState::Committing {
             // TODO: This changes the order
             self.txns.insert(id.clone(), txn);
-            return Err(Error::InvalidTransactionState(id.clone()));
+            return Err(Error::InvalidTransactionState);
         }
 
         let commit_id = self.next_commit_id;
@@ -82,8 +86,8 @@ impl <TID, RID> Arbiter<TID, RID>
         let mut result = TransactionUpdate::no_change();
         for (id, txn) in self.txns.iter_mut().rev() {
             match txn.state_type {
-                TransactionStateType::InProgress |
-                TransactionStateType::WaitCommit => {
+                TransactionState::InProgress |
+                TransactionState::WaitCommit => {
                     for (seq, committed_writes) in self.completed_txns.iter() {
                         if *seq >= txn.created_commit && txn.is_commit_prevented(&committed_writes) {
                             result.mark_failed(id.clone());
@@ -105,8 +109,8 @@ impl <TID, RID> Arbiter<TID, RID>
         let mut result = TransactionUpdate::no_change();
         for (id, txn) in self.txns.iter_mut() {
             match txn.state_type {
-                TransactionStateType::WaitCommit => {
-                    if txn.try_commit(id, &self.pending_commits).unwrap() {
+                TransactionState::WaitCommit => {
+                    if txn.try_commit(&self.pending_commits).unwrap() {
                         self.pending_commits.extend(txn.written.iter().cloned());
                         result.mark_can_commit(id.clone());
                     }
@@ -128,115 +132,120 @@ impl <TID, RID> Arbiter<TID, RID>
         }
     }
 
-    fn with_transaction<F, R>(&mut self, id: &TID, f: F) -> Result<R, TID>
-        where F: FnOnce(&mut TransactionState<RID>) -> Result<R, TID> {
-        self.txns.get_mut(id).map_or(Err(Error::UnknownTransaction(id.clone())), f)
+    fn with_transaction<F, R>(&self, id: &TID, f: F) -> Result<R>
+        where F: FnOnce(&Transaction<RID>) -> Result<R> {
+        self.txns.get(id).map_or(Err(Error::UnknownTransaction), f)
+    }
+
+    fn with_transaction_mut<F, R>(&mut self, id: &TID, f: F) -> Result<R>
+        where F: FnOnce(&mut Transaction<RID>) -> Result<R> {
+        self.txns.get_mut(id).map_or(Err(Error::UnknownTransaction), f)
     }
 }
 
-struct TransactionState<RID> {
+struct Transaction<RID> {
     created_commit: CID,
-    state_type: TransactionStateType,
+    state_type: TransactionState,
     read: HashSet<RID>,
     written: HashSet<RID>
 }
 
-impl <RID> TransactionState<RID>
+impl <RID> Transaction<RID>
     where RID: Eq + Hash + Clone {
-    fn new(created_commit: CID) -> TransactionState<RID> {
-        TransactionState {
+    fn new(created_commit: CID) -> Self {
+        Transaction {
             created_commit,
-            state_type: TransactionStateType::InProgress,
+            state_type: TransactionState::InProgress,
             read: HashSet::new(),
             written: HashSet::new()
         }
     }
 
-    fn transaction_progress_many<TID: Clone, R, W> (&mut self, id: &TID, read: R, written: W) -> Result<(), TID>
+    fn transaction_progress_many<R, W> (&mut self, read: R, written: W) -> Result<()>
         where R: IntoIterator<Item=RID>,
               W: IntoIterator<Item=RID> {
         match self.state_type {
-            TransactionStateType::InProgress => {
+            TransactionState::InProgress => {
                 self.read.extend(read.into_iter());
                 self.written.extend(written.into_iter());
             },
-            _ => return Err(Error::InvalidTransactionState(id.clone()))
+            _ => return Err(Error::InvalidTransactionState)
         }
         Ok(())
     }
 
-    fn transaction_progress_read<TID: Clone>(&mut self, id: &TID, read: RID) -> Result<(), TID> {
+    fn transaction_progress_read(&mut self, read: RID) -> Result<()> {
         match self.state_type {
-            TransactionStateType::InProgress => {
+            TransactionState::InProgress => {
                 self.read.insert(read);
             },
-            _ => return Err(Error::InvalidTransactionState(id.clone()))
+            _ => return Err(Error::InvalidTransactionState)
         }
         Ok(())
     }
 
-    fn transaction_progress_write<TID: Clone>(&mut self, id: &TID, written: RID) -> Result<(), TID> {
+    fn transaction_progress_write(&mut self, written: RID) -> Result<()> {
         match self.state_type {
-            TransactionStateType::InProgress => {
+            TransactionState::InProgress => {
                 self.written.insert(written);
             },
-            _ => return Err(Error::InvalidTransactionState(id.clone()))
+            _ => return Err(Error::InvalidTransactionState)
         }
         Ok(())
     }
 
-    fn wait_commit<TID: Clone>(&mut self, id: &TID) -> Result<(), TID> {
+    fn wait_commit(&mut self) -> Result<()> {
         match self.state_type {
-            TransactionStateType::InProgress => self.state_type = TransactionStateType::WaitCommit,
-            _ => return Err(Error::InvalidTransactionState(id.clone()))
+            TransactionState::InProgress => self.state_type = TransactionState::WaitCommit,
+            _ => return Err(Error::InvalidTransactionState)
         }
         Ok(())
     }
 
-    fn try_commit<TID: Clone>(&mut self, id: &TID, pending_writes: &HashSet<RID>) -> Result<bool, TID> {
+    fn try_commit(&mut self, pending_writes: &HashSet<RID>) -> Result<bool> {
         match self.state_type {
-            TransactionStateType::WaitCommit => {
+            TransactionState::WaitCommit => {
                 let can_commit = self.written.is_disjoint(pending_writes);
                 if can_commit {
-                    self.state_type = TransactionStateType::Committing;
+                    self.state_type = TransactionState::Committing;
                 }
                 Ok(can_commit)
             },
-            _ => return Err(Error::InvalidTransactionState(id.clone()))
+            _ => return Err(Error::InvalidTransactionState)
         }
     }
 
-    fn commit_completed<TID: Clone>(&mut self, id: &TID) -> Result<(), TID> {
+    fn commit_completed(&mut self) -> Result<()> {
         match self.state_type {
-            TransactionStateType::Committing => {}
-            _ => return Err(Error::InvalidTransactionState(id.clone()))
+            TransactionState::Committing => {}
+            _ => return Err(Error::InvalidTransactionState)
         }
         Ok(())
     }
 
     fn is_commit_prevented(&self, committed_writes: &HashSet<RID>) -> bool {
         match self.state_type {
-            TransactionStateType::InProgress => !self.read.is_disjoint(committed_writes),
-            TransactionStateType::WaitCommit => !self.read.is_disjoint(committed_writes),
+            TransactionState::InProgress => !self.read.is_disjoint(committed_writes),
+            TransactionState::WaitCommit => !self.read.is_disjoint(committed_writes),
             _ => false
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum TransactionStateType {
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TransactionState {
     InProgress,
     WaitCommit,
     Committing
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Error<TID> {
-    UnknownTransaction(TID),
-    InvalidTransactionState(TID)
+pub enum Error {
+    UnknownTransaction,
+    InvalidTransactionState
 }
 
-pub type Result<T, TID> = std::result::Result<T, Error<TID>>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct TransactionUpdate<TID> {
@@ -275,6 +284,14 @@ impl <TID> TransactionUpdate<TID> {
     fn merge(&mut self, other: Self) {
         self.can_commit.extend(other.can_commit);
         self.failed.extend(other.failed);
+    }
+
+    pub fn get_can_commit(&self) -> &Vec<TID> {
+        &self.can_commit
+    }
+
+    pub fn get_failed(&self) -> &Vec<TID> {
+        &self.failed
     }
 }
 
