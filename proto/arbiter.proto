@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package arbiter;
+
+service Arbiter {
+    rpc StartTransaction(StartTransactionRequest) returns (StartTransactionResponse);
+}
+
+message StartTransactionRequest {
+    uint64 tid = 1;
+}
+
+message StartTransactionResponse {
+
+}
+
+message ResourcesAccessed {
+    uint64 tid = 1;
+    repeated string read_rids = 2;
+    repeated string written_rids = 3;
+}
