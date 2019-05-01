@@ -4,18 +4,36 @@ package arbiter;
 
 service Arbiter {
     rpc StartTransaction(StartTransactionRequest) returns (StartTransactionResponse);
+    rpc WaitCommit(WaitCommitRequest) returns (WaitCommitResponse);
 }
 
 message StartTransactionRequest {
     uint64 tid = 1;
 }
 
-message StartTransactionResponse {
+message StartTransactionResponse { }
 
+enum Error {
+    Ok = 0;
+    UnknownTransaction = 1;
+    InvalidTransactionState = 2;
 }
 
 message ResourcesAccessed {
     uint64 tid = 1;
     repeated string read_rids = 2;
     repeated string written_rids = 3;
+}
+
+message WaitCommitRequest {
+    uint64 tid = 1;
+}
+
+message WaitCommitResponse {
+    Error error = 1;
+    enum CommitStatus {
+        Proceed = 0;
+        Retry = 1;
+    }
+    CommitStatus status = 2;
 }

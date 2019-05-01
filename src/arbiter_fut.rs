@@ -39,7 +39,7 @@ impl <TID, RID> ArbiterFut<TID, RID>
 
     pub fn start_commit(&mut self, id: &TID) -> impl Future<Item=CommitResult, Error=Error> {
         match self.check_cancelled(id) {
-            Ok(false) => return Either::A(ok(CommitResult::MustRetry)),
+            Ok(false) => return Either::A(ok(CommitResult::Retry)),
             Err(e) => return Either::A(err(e)),
             _ => {}
         }
@@ -48,9 +48,9 @@ impl <TID, RID> ArbiterFut<TID, RID>
             Ok(update) => {
                 self.handle_update(&update);
                 if update.get_can_commit().contains(id) {
-                    Either::A(ok(CommitResult::CanCommit))
+                    Either::A(ok(CommitResult::Proceed))
                 } else if update.get_failed().contains(id) {
-                    Either::A(ok(CommitResult::MustRetry))
+                    Either::A(ok(CommitResult::Retry))
                 } else {
                     let (sender, receiver) = channel();
                     self.waiting.insert(id.clone(), sender);
@@ -73,13 +73,13 @@ impl <TID, RID> ArbiterFut<TID, RID>
     fn handle_update(&mut self, update: &TransactionUpdate<TID>) {
         for id in update.get_can_commit().iter() {
             self.waiting.remove(id).map(|chan| chan
-                .send(CommitResult::CanCommit)
+                .send(CommitResult::Proceed)
                 .unwrap_or_else(|e| warn!("Failed to send: {:?}", e)));
         }
 
         for id in update.get_failed().iter() {
             self.waiting.remove(id).map(|chan| chan
-                .send(CommitResult::MustRetry)
+                .send(CommitResult::Retry)
                 .unwrap_or_else(|e| warn!("Failed to send: {:?}", e)));
         }
     }
@@ -96,6 +96,6 @@ impl <TID, RID> ArbiterFut<TID, RID>
 
 #[derive(Debug)]
 pub enum CommitResult {
-    CanCommit,
-    MustRetry
+    Proceed,
+    Retry
 }
