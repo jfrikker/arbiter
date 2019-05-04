@@ -4,6 +4,7 @@ package arbiter;
 
 service Arbiter {
     rpc StartTransaction(StartTransactionRequest) returns (StartTransactionResponse);
+    rpc ResourcesAccessed(stream ResourcesAccessedRequest) returns (ResourcesAccessedResponse);
     rpc WaitCommit(WaitCommitRequest) returns (WaitCommitResponse);
 }
 
@@ -17,12 +18,18 @@ enum Error {
     Ok = 0;
     UnknownTransaction = 1;
     InvalidTransactionState = 2;
+    InvalidMessage = 3;
 }
 
-message ResourcesAccessed {
+message ResourcesAccessedRequest {
     uint64 tid = 1;
     repeated string read_rids = 2;
     repeated string written_rids = 3;
+}
+
+message ResourcesAccessedResponse {
+    Error error = 1;
+    bool can_proceed = 2;
 }
 
 message WaitCommitRequest {

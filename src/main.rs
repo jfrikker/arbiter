@@ -2,6 +2,7 @@ mod arbiter;
 mod arbiter_fut;
 mod messages;
 
+use futures::try_ready;
 use log::{error, info};
 use messages::*;
 use std::rc::Rc;
@@ -9,17 +10,12 @@ use std::cell::RefCell;
 use tokio::runtime::current_thread::{TaskExecutor, run, spawn};
 use tokio::net::TcpListener;
 use tokio::prelude::*;
-use tower_grpc::{Request, Response, Status};
+use tower_grpc::{Request, Response, Status, Streaming};
 use tower_h2::Server;
 
 type TID = u64;
 type RID = String;
 type State = arbiter_fut::ArbiterFut<TID, RID>;
-
-#[derive(Clone)]
-struct ArbiterHandler {
-    state: Rc<RefCell<State>>
-}
 
 impl Into<Error> for arbiter::Error {
     fn into(self) -> Error {
@@ -28,6 +24,11 @@ impl Into<Error> for arbiter::Error {
             arbiter::Error::InvalidTransactionState => Error::InvalidTransactionState
         }
     }
+}
+
+#[derive(Clone)]
+struct ArbiterHandler {
+    state: Rc<RefCell<State>>
 }
 
 impl server::Arbiter for ArbiterHandler {
@@ -39,6 +40,15 @@ impl server::Arbiter for ArbiterHandler {
         state.start_transaction(tid);
         let result = StartTransactionResponse {};
         future::ok(Response::new(result))
+    }
+
+    type ResourcesAccessedFuture = ResourcesAccessedFuture;
+    fn resources_accessed(&mut self, request: Request<Streaming<ResourcesAccessedRequest>>) -> Self::ResourcesAccessedFuture {
+        ResourcesAccessedFuture {
+            tid: None,
+            underlying: Box::new(request.into_inner()),
+            state: self.state.clone()
+        }
     }
 
     type WaitCommitFuture = Box<Future<Item=Response<WaitCommitResponse>, Error=Status>>;
@@ -70,6 +80,44 @@ impl server::Arbiter for ArbiterHandler {
                 future::ok(Response::new(result))
             });
         Box::new(fut)
+    }
+}
+
+struct ResourcesAccessedFuture {
+    tid: Option<TID>,
+    underlying: Box<Stream<Item=ResourcesAccessedRequest, Error=Status>>,
+    state: Rc<RefCell<State>>
+}
+
+impl Future for ResourcesAccessedFuture {
+    type Item = Response<ResourcesAccessedResponse>;
+    type Error = Status;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let next = try_ready!(self.underlying.poll());
+        let mut arbiter = self.state.borrow_mut();
+        let res = match next {
+            None => Async::Ready(Response::new(ResourcesAccessedResponse {can_proceed: true, error: Error::Ok as i32})),
+            Some(req) => {
+                if self.tid == None {
+                    self.tid = Some(req.tid);
+                }
+
+                if self.tid != Some(req.tid) {
+                    Async::Ready(Response::new(ResourcesAccessedResponse {can_proceed: false, error: Error::InvalidMessage as i32}))
+                } else {
+                    match arbiter.transaction_progress_many(&req.tid, req.read_rids, req.written_rids) {
+                        Ok(true) => Async::NotReady,
+                        Ok(false) => Async::Ready(Response::new(ResourcesAccessedResponse {can_proceed: false, error: Error::Ok as i32})),
+                        Err(e) => {
+                            let e: Error = e.into();
+                            Async::Ready(Response::new(ResourcesAccessedResponse {can_proceed: false, error: e as i32}))
+                        }
+                    }
+                }
+            }
+        };
+        Ok(res)
     }
 }
 
