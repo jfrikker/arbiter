@@ -81,6 +81,17 @@ impl server::Arbiter for ArbiterHandler {
             });
         Box::new(fut)
     }
+
+    type CommitCompletedFuture = future::FutureResult<Response<CommitCompletedResponse>, Status>;
+    fn commit_completed(&mut self, request: Request<CommitCompletedRequest>) -> Self::CommitCompletedFuture {
+        let tid = request.into_inner().tid;
+        let mut state = self.state.borrow_mut();
+        let err = state.commit_completed(&tid)
+            .map(|_| Error::Ok)
+            .unwrap_or_else(|e| e.into());
+        let result = CommitCompletedResponse {error: err.into()};
+        future::ok(Response::new(result))
+    }
 }
 
 struct ResourcesAccessedFuture {

@@ -6,6 +6,7 @@ service Arbiter {
     rpc StartTransaction(StartTransactionRequest) returns (StartTransactionResponse);
     rpc ResourcesAccessed(stream ResourcesAccessedRequest) returns (ResourcesAccessedResponse);
     rpc WaitCommit(WaitCommitRequest) returns (WaitCommitResponse);
+    rpc CommitCompleted(CommitCompletedRequest) returns (CommitCompletedResponse);
 }
 
 message StartTransactionRequest {
@@ -43,4 +44,12 @@ message WaitCommitResponse {
         Retry = 1;
     }
     CommitStatus status = 2;
+}
+
+message CommitCompletedRequest {
+    uint64 tid = 1;
+}
+
+message CommitCompletedResponse {
+    Error error = 1;
 }
